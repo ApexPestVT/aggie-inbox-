@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.2';
+const VERSION = '1.3';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -270,16 +270,21 @@ async function draftTick() {
 // rows - seconds, not 50). Every 10 minutes: the full build with the clients list, replacing the lane whole (that is
 // how rows that fell out of the kit's window leave). Overlap of 90s on the incremental so nothing slips between beats.
 // The kit is a single slow web app - never ask it two things at once (kitCall serializes every kit request).
-const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0, lastFull: 0, incs: 0, lastLanes: null, lastRows: 0 };
+const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0, lastFull: 0, incs: 0, lastLanes: null, lastRows: 0, busy: false, skipped: 0 };
 const _kitQueues = { lanes: Promise.resolve(), wo: Promise.resolve() };
 function kitCall(fn, lane) { lane = lane || 'lanes'; const p = _kitQueues[lane].then(fn, fn); _kitQueues[lane] = p.catch(() => { }); return p; }   // v1.2: board pulls have their own line - a 50s lane build never holds a drag's fresh read
 async function gasPull(mode) {
   if (!GAS_URL) return;
+  // v1.3 ONE ASK AT A TIME. The 10s beat used to queue a new ask whether or not the last one had come back; with the kit
+  // answering in ~38s the line grew 18 minutes deep (health lastMs 1115113, Sept 23). A beat that finds an ask in flight
+  // now steps aside; an explicit 'full' (the app's resync, the /inbox/pull door) still waits its turn.
+  if (gas.busy && mode !== 'full') { gas.skipped++; return; }
+  gas.busy = true;
   const full = (mode === 'full') || !gas.lastFull || (Date.now() - gas.lastFull > 10 * 60000);
-  const t0 = Date.now();
+  let t0 = Date.now();
   try {
     const since = full ? '' : String(Math.max(0, (gas.lastAt || 0) - 90000));
-    const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxlanes&k=' + encodeURIComponent(GAS_KEY) + (full ? '&clients=1' : '&since=' + since), { timeout: 150000 }));
+    const r = await kitCall(() => { t0 = Date.now(); return fetchJson(GAS_URL + '?hook=ibxlanes&k=' + encodeURIComponent(GAS_KEY) + (full ? '&clients=1' : '&since=' + since), { timeout: 150000 }); });   // v1.3: ms measures the kit's answer, not the wait in line
     if (!r.json || !r.json.ok) throw new Error('ibxlanes ' + r.status + ' ' + (r.raw || '').slice(0, 160));
     const j = r.json, now = Date.now();
     const tx = db.transaction(() => {
@@ -295,6 +300,7 @@ async function gasPull(mode) {
     if (full) gas.lastFull = now; else gas.incs++;
     q.intentDelOld.run(now - 10 * 60000);
   } catch (e) { gas.lastErr = String(e && e.message || e).slice(0, 300); console.error('[gas]', gas.lastErr); }
+  finally { gas.busy = false; }
 }
 // ---------------------------------------------------------------- work orders + clients mirror (v1.1, phase 1)
 // The kit stays the writer. Every few seconds we ask hook=wofeed 'anything new since <gen>?' (two cache stamps on the
@@ -486,7 +492,7 @@ let _etag = '';
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
   if (req.method === 'OPTIONS') return send(res, 204, {}, req);
-  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, lanes: gas.lastLanes, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
+  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, busy: gas.busy, skipped: gas.skipped, lanes: gas.lastLanes, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
   const key = u.query.key || req.headers['x-inbox-key'] || '';
   if (!KEY || key !== KEY) return send(res, 403, { ok: false, message: 'forbidden' }, req);
   try {
