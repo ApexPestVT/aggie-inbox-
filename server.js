@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.1.1';
+const VERSION = '1.2';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -266,20 +266,24 @@ async function draftTick() {
 }
 
 // ---------------------------------------------------------------- kit (GAS) mirror
-const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0 };
-// v1.1.1: the kit is a single slow web app - never ask it two things at once (the 5s board peek was landing on top of
-// the 30s lane pull; each made the other slower and the lane pull timed out cold)
-let _kitQueue = Promise.resolve();
-function kitCall(fn) { const p = _kitQueue.then(fn, fn); _kitQueue = p.catch(() => { }); return p; }
-async function gasPull() {
+// v1.2 PHASE 2 - THE LANES COME IN INCREMENTALLY. Every 10s: 'what moved since <last>?' (the kit reads only its newest
+// rows - seconds, not 50). Every 10 minutes: the full build with the clients list, replacing the lane whole (that is
+// how rows that fell out of the kit's window leave). Overlap of 90s on the incremental so nothing slips between beats.
+// The kit is a single slow web app - never ask it two things at once (kitCall serializes every kit request).
+const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0, lastFull: 0, incs: 0, lastLanes: null, lastRows: 0 };
+const _kitQueues = { lanes: Promise.resolve(), wo: Promise.resolve() };
+function kitCall(fn, lane) { lane = lane || 'lanes'; const p = _kitQueues[lane].then(fn, fn); _kitQueues[lane] = p.catch(() => { }); return p; }   // v1.2: board pulls have their own line - a 50s lane build never holds a drag's fresh read
+async function gasPull(mode) {
   if (!GAS_URL) return;
+  const full = (mode === 'full') || !gas.lastFull || (Date.now() - gas.lastFull > 10 * 60000);
   const t0 = Date.now();
   try {
-    const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxlanes&k=' + encodeURIComponent(GAS_KEY), { timeout: 150000 }));
-    if (!r.json || !r.json.ok) throw new Error('ibxlanes ' + r.status + ' ' + (r.raw || '').slice(0, 120));
+    const since = full ? '' : String(Math.max(0, (gas.lastAt || 0) - 90000));
+    const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxlanes&k=' + encodeURIComponent(GAS_KEY) + (full ? '&clients=1' : '&since=' + since), { timeout: 150000 }));
+    if (!r.json || !r.json.ok) throw new Error('ibxlanes ' + r.status + ' ' + (r.raw || '').slice(0, 160));
     const j = r.json, now = Date.now();
     const tx = db.transaction(() => {
-      q.delLane.run('gas');
+      if (full) q.delLane.run('gas');
       (j.rows || []).forEach((row) => { if (row && row.id) q.upsert.run(String(row.id), 'gas', Number(row.ts) || 0, JSON.stringify(row), now); });
       const M = j.maps || {};
       ['done', 'filed', 'triage', 'stars', 'ops', 'machOvr', 'machSenders', 'mute'].forEach((k) => { if (M[k]) state.set(k, M[k]); });
@@ -287,8 +291,8 @@ async function gasPull() {
       if (j.clients) state.set('clients', j.clients);
     });
     tx();
-    gas.lastAt = now; gas.lastErr = ''; gas.pulls++; gas.ms = now - t0;
-    // the kit confirmed what it holds: intents older than this pull that agree with it are spent
+    gas.lastAt = now; gas.lastErr = ''; gas.pulls++; gas.ms = now - t0; gas.lastLanes = j._lanes || null; gas.lastRows = (j.rows || []).length;
+    if (full) gas.lastFull = now; else gas.incs++;
     q.intentDelOld.run(now - 10 * 60000);
   } catch (e) { gas.lastErr = String(e && e.message || e).slice(0, 300); console.error('[gas]', gas.lastErr); }
 }
@@ -297,14 +301,14 @@ async function gasPull() {
 // kit side, ~1s). On a change we take the full slim feed - the exact payload getWorkOrdersData hands the app - and the
 // clients list, and replace the mirror whole. The app reads /wo in ~100ms. /wo?fresh=1 pulls first, so a reload that
 // follows the owner's own save never sees the pre-save world.
-const wo = { busy: null, lastAt: 0, lastFull: 0, err: '', gen: '', peeks: 0, fulls: 0, ms: 0, extra: {} };
+const wo = { busy: null, lastAt: 0, lastFull: 0, err: '', gen: '', peeks: 0, fulls: 0, ms: 0 };
 async function woPull(force) {
   if (!GAS_URL) return;
   if (wo.busy) return wo.busy;
   wo.busy = (async () => {
     const t0 = Date.now();
     try {
-      const r = await kitCall(() => fetchJson(GAS_URL + '?hook=wofeed&k=' + encodeURIComponent(GAS_KEY) + '&since=' + encodeURIComponent(force ? '' : (meta.get('wo_gen') || '')), { timeout: 150000 }));
+      const r = await kitCall(() => fetchJson(GAS_URL + '?hook=wofeed&k=' + encodeURIComponent(GAS_KEY) + '&since=' + encodeURIComponent(force ? '' : (meta.get('wo_gen') || '')), { timeout: 150000 }), 'wo');
       if (!r.json || !r.json.ok) throw new Error('wofeed ' + r.status + ' ' + (r.raw || '').slice(0, 160));
       const j = r.json; wo.peeks++;
       if (j.same) { wo.lastAt = Date.now(); wo.err = ''; return; }
@@ -327,8 +331,7 @@ async function woPull(force) {
 function woPayload() {
   const rows = q.woAll.all().map((r) => { try { return JSON.parse(r.json); } catch (e) { return null; } }).filter(Boolean);
   const extra = state.get('wo_extra', {});
-  const body = Object.assign({}, extra, { workOrders: rows, _via: 'data-svc', gen: meta.get('wo_gen') || '', syncedAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err });
-  return body;
+  return Object.assign({}, extra, { workOrders: rows, _via: 'data-svc', gen: meta.get('wo_gen') || '', syncedAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err });
 }
 async function outboxTick() {
   if (!GAS_URL) return;
@@ -483,7 +486,7 @@ let _etag = '';
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
   if (req.method === 'OPTIONS') return send(res, 204, {}, req);
-  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, err: gas.lastErr, pulls: gas.pulls, lastMs: gas.ms, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
+  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, lanes: gas.lastLanes, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
   const key = u.query.key || req.headers['x-inbox-key'] || '';
   if (!KEY || key !== KEY) return send(res, 403, { ok: false, message: 'forbidden' }, req);
   try {
@@ -506,7 +509,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { success: true, dataB64: b64(a.data).toString('base64') }, req);
     }
     if (u.pathname === '/wo') {
-      if (String(u.query.fresh || '') === '1' || !wo.lastFull) await woPull(false);
+      if (String(u.query.fresh || '') === '1' || !wo.lastFull) { if (wo.busy) { try { await wo.busy; } catch (e) { } } await woPull(false); }   // v1.2: the in-flight pull may predate the save - wait it out, then pull again
       const body = woPayload();
       const et = require('crypto').createHash('md5').update(body.gen + '|' + wo.lastFull).digest('hex');
       if (u.query.etag && u.query.etag === et) return send(res, 200, { ok: true, same: true, etag: et, gen: body.gen, syncedAt: wo.lastAt }, req);
@@ -519,7 +522,7 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/clients') { return send(res, 200, { clients: state.get('clients_full', []), _via: 'data-svc', syncedAt: wo.lastFull }, req); }
     if (req.method === 'POST' && u.pathname === '/wo/pull') { await woPull(String(u.query.full || '') === '1'); return send(res, 200, { ok: true, gen: wo.gen, err: wo.err, rows: q.woCount.get().n }, req); }
     if (req.method === 'POST' && u.pathname === '/inbox/act') { const b = await readBody(req); return send(res, 200, await act(b), req); }
-    if (req.method === 'POST' && u.pathname === '/inbox/pull') { await gasPull(); return send(res, 200, { ok: true, kitAt: gas.lastAt, err: gas.lastErr }, req); }
+    if (req.method === 'POST' && u.pathname === '/inbox/pull') { await gasPull('full'); return send(res, 200, { ok: true, kitAt: gas.lastAt, err: gas.lastErr, rows: gas.lastRows }, req); }
     if (req.method === 'POST' && u.pathname === '/inbox/resync') { await fullSync(); return send(res, 200, { ok: true, rows: q.all.all().length }, req); }
     return send(res, 404, { ok: false, message: 'no such door' }, req);
   } catch (e) { return send(res, 500, { ok: false, message: String(e && e.message || e).slice(0, 300) }, req); }
@@ -527,9 +530,9 @@ const server = http.createServer(async (req, res) => {
 if (require.main === module) {
   server.listen(PORT, () => { console.log('aggie-inbox v' + VERSION + ' on ' + PORT + ' db=' + DB_PATH); });
   // ---------------------------------------------------------------- beats
-  setTimeout(() => { syncTick(); gasPull(); }, 500);
+  setTimeout(() => { syncTick(); gasPull('full'); }, 500);
   setInterval(syncTick, 10000);
-  setInterval(() => { gasPull(); }, 30000);
+  setInterval(() => { gasPull(); }, 10000);
   setInterval(() => { outboxTick().catch(() => { }); }, 5000);
   setInterval(draftTick, 60000);
   setTimeout(() => { woPull(true); }, 1500);
