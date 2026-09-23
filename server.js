@@ -267,11 +267,15 @@ async function draftTick() {
 
 // ---------------------------------------------------------------- kit (GAS) mirror
 const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0 };
+// v1.1.1: the kit is a single slow web app - never ask it two things at once (the 5s board peek was landing on top of
+// the 30s lane pull; each made the other slower and the lane pull timed out cold)
+let _kitQueue = Promise.resolve();
+function kitCall(fn) { const p = _kitQueue.then(fn, fn); _kitQueue = p.catch(() => { }); return p; }
 async function gasPull() {
   if (!GAS_URL) return;
   const t0 = Date.now();
   try {
-    const r = await fetchJson(GAS_URL + '?hook=ibxlanes&k=' + encodeURIComponent(GAS_KEY), { timeout: 60000 });
+    const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxlanes&k=' + encodeURIComponent(GAS_KEY), { timeout: 150000 }));
     if (!r.json || !r.json.ok) throw new Error('ibxlanes ' + r.status + ' ' + (r.raw || '').slice(0, 120));
     const j = r.json, now = Date.now();
     const tx = db.transaction(() => {
@@ -300,7 +304,7 @@ async function woPull(force) {
   wo.busy = (async () => {
     const t0 = Date.now();
     try {
-      const r = await fetchJson(GAS_URL + '?hook=wofeed&k=' + encodeURIComponent(GAS_KEY) + '&since=' + encodeURIComponent(force ? '' : (meta.get('wo_gen') || '')), { timeout: 90000 });
+      const r = await kitCall(() => fetchJson(GAS_URL + '?hook=wofeed&k=' + encodeURIComponent(GAS_KEY) + '&since=' + encodeURIComponent(force ? '' : (meta.get('wo_gen') || '')), { timeout: 150000 }));
       if (!r.json || !r.json.ok) throw new Error('wofeed ' + r.status + ' ' + (r.raw || '').slice(0, 160));
       const j = r.json; wo.peeks++;
       if (j.same) { wo.lastAt = Date.now(); wo.err = ''; return; }
@@ -330,7 +334,7 @@ async function outboxTick() {
   if (!GAS_URL) return;
   for (const row of q.outNext.all()) {
     try {
-      const r = await fetchJson(GAS_URL + '?hook=ibxact&k=' + encodeURIComponent(GAS_KEY), { method: 'POST', body: row.payload, timeout: 40000 });
+      const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxact&k=' + encodeURIComponent(GAS_KEY), { method: 'POST', body: row.payload, timeout: 60000 }));
       if (r.json && r.json.ok) q.outDel.run(row.id);
       else if (row.tries >= 20) { q.outDel.run(row.id); console.error('[outbox] dropped after 20 tries', row.payload.slice(0, 120)); }
       else q.outFail.run(String((r.raw || '').slice(0, 200)), row.id);
@@ -479,7 +483,7 @@ let _etag = '';
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
   if (req.method === 'OPTIONS') return send(res, 204, {}, req);
-  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, err: gas.lastErr, pulls: gas.pulls, lastMs: gas.ms, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
+  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, err: gas.lastErr, pulls: gas.pulls, lastMs: gas.ms, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
   const key = u.query.key || req.headers['x-inbox-key'] || '';
   if (!KEY || key !== KEY) return send(res, 403, { ok: false, message: 'forbidden' }, req);
   try {
