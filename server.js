@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.3';
+const VERSION = '1.4';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, payload 
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS wo(id TEXT PRIMARY KEY, date TEXT, json TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS wo_date ON wo(date);
+CREATE TABLE IF NOT EXISTS calls_raw(id TEXT PRIMARY KEY, phone TEXT, ts INTEGER DEFAULT 0, json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS calls_raw_phone ON calls_raw(phone, ts);
+CREATE INDEX IF NOT EXISTS calls_raw_ts ON calls_raw(ts);
+CREATE TABLE IF NOT EXISTS sms_raw(k TEXT PRIMARY KEY, phone TEXT, ts INTEGER DEFAULT 0, json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS sms_raw_phone ON sms_raw(phone, ts);
 `);
 const q = {
   upsert: db.prepare('INSERT INTO rows(id,lane,ts,json,updatedAt) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET lane=excluded.lane, ts=excluded.ts, json=excluded.json, updatedAt=excluded.updatedAt'),
@@ -80,6 +85,15 @@ const q = {
   woAll: db.prepare('SELECT json FROM wo ORDER BY date'),
   woClear: db.prepare('DELETE FROM wo'),
   woCount: db.prepare('SELECT COUNT(*) n FROM wo'),
+  crUp: db.prepare('INSERT INTO calls_raw(id,phone,ts,json) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET phone=excluded.phone, ts=excluded.ts, json=excluded.json'),
+  crByPhone: db.prepare('SELECT json FROM calls_raw WHERE phone=? ORDER BY ts DESC LIMIT ?'),
+  crRecent: db.prepare('SELECT json FROM calls_raw ORDER BY ts DESC LIMIT ?'),
+  crCount: db.prepare('SELECT COUNT(*) n FROM calls_raw'),
+  crMaxTs: db.prepare('SELECT MAX(ts) t FROM calls_raw'),
+  smUp: db.prepare('INSERT INTO sms_raw(k,phone,ts,json) VALUES(?,?,?,?) ON CONFLICT(k) DO NOTHING'),
+  smByPhone: db.prepare('SELECT json FROM sms_raw WHERE phone=? ORDER BY ts DESC LIMIT ?'),
+  smCount: db.prepare('SELECT COUNT(*) n FROM sms_raw'),
+  smMaxTs: db.prepare('SELECT MAX(ts) t FROM sms_raw'),
 };
 const meta = { get: (k) => { const r = q.metaGet.get(k); return r ? r.v : ''; }, set: (k, v) => q.metaSet.run(k, String(v)) };
 const state = {
@@ -302,6 +316,51 @@ async function gasPull(mode) {
   } catch (e) { gas.lastErr = String(e && e.message || e).slice(0, 300); console.error('[gas]', gas.lastErr); }
   finally { gas.busy = false; }
 }
+// ---------------------------------------------------------------- raw comms mirror + Aggie's context (v1.4, phase 2)
+// The kit stays the writer of calls and texts. Every 10s we ask hook=commsraw 'rows since <ts>' (tail reads only, ~1s);
+// every 10 min the last 400 calls + 1200 text rows whole. GET /ctx?phone= hands Aggie everything she used to scan
+// three sheets for: the customer, their jobs, their texts, their calls, and the 30 most recent calls overall.
+const comms = { busy: false, lastAt: 0, lastFull: 0, err: '', pulls: 0, ms: 0, skipped: 0, lastCalls: 0, lastSms: 0 };
+function p10(x) { return String(x || '').replace(/[^0-9]/g, '').slice(-10); }
+function smsKey(r) { return String(r.platform || '') + '|' + String(r.senderId || '') + '|' + String(r.ts || '') + '|' + require('crypto').createHash('md5').update(String(r.text || '')).digest('hex').slice(0, 12); }
+async function commsPull(mode) {
+  if (!GAS_URL) return;
+  if (comms.busy && mode !== 'full') { comms.skipped++; return; }
+  comms.busy = true;
+  const full = (mode === 'full') || !comms.lastFull || (Date.now() - comms.lastFull > 10 * 60000);
+  let t0 = Date.now();
+  try {
+    const sinceC = full ? 0 : Math.max(0, Number((q.crMaxTs.get() || {}).t || 0) - 120000);
+    const sinceS = full ? 0 : Math.max(0, Number((q.smMaxTs.get() || {}).t || 0) - 120000);
+    const r = await kitCall(() => { t0 = Date.now(); return fetchJson(GAS_URL + '?hook=commsraw&k=' + encodeURIComponent(GAS_KEY) + '&sinceCalls=' + sinceC + '&sinceSms=' + sinceS, { timeout: 150000 }); });
+    if (!r.json || !r.json.ok) throw new Error('commsraw ' + r.status + ' ' + (r.raw || '').slice(0, 160));
+    const j = r.json;
+    const tx = db.transaction(() => {
+      (j.calls || []).forEach((c) => { if (!c || !c.id) return; const other = (String(c.direction || '') === 'out') ? c.toNum : c.fromNum; q.crUp.run(String(c.id), p10(other), Number(c.tsMs) || Date.parse(String(c.ts || '')) || 0, JSON.stringify(c)); });
+      (j.sms || []).forEach((r2) => { if (!r2 || !r2.senderId) return; q.smUp.run(smsKey(r2), p10(r2.senderId), Number(r2.tsMs) || 0, JSON.stringify(r2)); });
+    });
+    tx();
+    comms.lastAt = Date.now(); comms.err = ''; comms.pulls++; comms.ms = Date.now() - t0; comms.lastCalls = (j.calls || []).length; comms.lastSms = (j.sms || []).length;
+    if (full) comms.lastFull = comms.lastAt;
+  } catch (e) { comms.err = String(e && e.message || e).slice(0, 300); console.error('[comms]', comms.err); }
+  finally { comms.busy = false; }
+}
+function ctxFor(phone, opts) {
+  opts = opts || {};
+  const ph = p10(phone);
+  const out = { ok: true, phone: ph, at: Date.now(), syncedAt: comms.lastAt, client: null, wos: [], sms: [], calls: [], recent: [] };
+  const J = (r) => { try { return JSON.parse(r.json); } catch (e) { return null; } };
+  if (ph) {
+    const clients = state.get('clients_full', []) || [];
+    out.client = clients.find((c) => c && (p10(c.phone) === ph || p10(c.phone2) === ph || p10(c.altPhone) === ph)) || null;
+    const cid = out.client ? String(out.client.id || '') : '';
+    out.wos = q.woAll.all().map(J).filter((w) => w && ((cid && String(w.clientId || '') === cid) || p10(w.clientPhone) === ph));
+    out.sms = q.smByPhone.all(ph, Number(opts.nSms) || 40).map(J).filter(Boolean);
+    out.calls = q.crByPhone.all(ph, Number(opts.nCalls) || 10).map(J).filter(Boolean);
+  }
+  if (opts.recent !== false) out.recent = q.crRecent.all(Number(opts.nRecent) || 30).map(J).filter(Boolean).map((c) => { if (c.transcript && c.transcript.length > 4000) c.transcript = c.transcript.slice(0, 4000); return c; });
+  return out;
+}
 // ---------------------------------------------------------------- work orders + clients mirror (v1.1, phase 1)
 // The kit stays the writer. Every few seconds we ask hook=wofeed 'anything new since <gen>?' (two cache stamps on the
 // kit side, ~1s). On a change we take the full slim feed - the exact payload getWorkOrdersData hands the app - and the
@@ -492,7 +551,7 @@ let _etag = '';
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
   if (req.method === 'OPTIONS') return send(res, 204, {}, req);
-  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, busy: gas.busy, skipped: gas.skipped, lanes: gas.lastLanes, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
+  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, busy: gas.busy, skipped: gas.skipped, lanes: gas.lastLanes, outbox: q.outCount.get().n }, comms: { calls: q.crCount.get().n, sms: q.smCount.get().n, lastAt: comms.lastAt, lastFull: comms.lastFull, err: comms.err, pulls: comms.pulls, lastMs: comms.ms, busy: comms.busy, skipped: comms.skipped }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
   const key = u.query.key || req.headers['x-inbox-key'] || '';
   if (!KEY || key !== KEY) return send(res, 403, { ok: false, message: 'forbidden' }, req);
   try {
@@ -525,6 +584,8 @@ const server = http.createServer(async (req, res) => {
       const tok = meta.get('wo_gen') || '';
       return send(res, 200, { ok: true, token: tok, changes: [], changed: String(u.query.since || '') !== tok, syncedAt: wo.lastAt }, req);
     }
+    if (u.pathname === '/ctx') { return send(res, 200, ctxFor(u.query.phone || '', { recent: String(u.query.recent || '1') !== '0', nSms: u.query.nSms, nCalls: u.query.nCalls, nRecent: u.query.nRecent }), req); }   // v1.4
+    if (req.method === 'POST' && u.pathname === '/comms/pull') { await commsPull('full'); return send(res, 200, { ok: true, at: comms.lastAt, err: comms.err, calls: q.crCount.get().n, sms: q.smCount.get().n }, req); }   // v1.4
     if (u.pathname === '/clients') { return send(res, 200, { clients: state.get('clients_full', []), _via: 'data-svc', syncedAt: wo.lastFull }, req); }
     if (req.method === 'POST' && u.pathname === '/wo/pull') { await woPull(String(u.query.full || '') === '1'); return send(res, 200, { ok: true, gen: wo.gen, err: wo.err, rows: q.woCount.get().n }, req); }
     if (req.method === 'POST' && u.pathname === '/inbox/act') { const b = await readBody(req); return send(res, 200, await act(b), req); }
@@ -539,6 +600,8 @@ if (require.main === module) {
   setTimeout(() => { syncTick(); gasPull('full'); }, 500);
   setInterval(syncTick, 10000);
   setInterval(() => { gasPull(); }, 10000);
+  setTimeout(() => { commsPull('full'); }, 3000);
+  setInterval(() => { commsPull(); }, 10000);   // v1.4
   setInterval(() => { outboxTick().catch(() => { }); }, 5000);
   setInterval(draftTick, 60000);
   setTimeout(() => { woPull(true); }, 1500);
