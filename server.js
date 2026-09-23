@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.4';
+const VERSION = '1.5';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -428,7 +428,8 @@ function assemble() {
     if (op[String(j.id)]) j.ops = true;
     const v = dn[String(j.id)];
     const dAt = (v === 1 || v === '1') ? 0 : (Number(v) || 0);
-    if (v && Number(v) !== 0) { if (Number(j.ts || 0) > dAt && (j.unread || !j.answered)) j.done = false; else j.done = true; }
+    const spk = (j.spokeTs !== undefined) ? Number(j.spokeTs || 0) : Number(j.ts || 0);   // v1.5: texts carry when THEY last spoke (kit v38.663); system rows never bounce a handled thread
+    if (v && Number(v) !== 0) { if (spk > dAt && (j.unread || !j.answered)) j.done = false; else j.done = true; }
     else if (v === 0 || v === '0') j.reopened = true;
     const k = String(j.tkey || ''); if (k && fl[k]) j.filed = fl[k];
     if (mu[String(j.id).toLowerCase()] || (j.email && mu[String(j.email).toLowerCase()])) j.muted = true;
