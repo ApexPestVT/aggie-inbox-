@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.0';
+const VERSION = '1.1.1';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -43,6 +43,7 @@ const MAIL_CAP = Math.max(100, Math.min(500, Number(process.env.MAIL_CAP) || 400
 const SELF_RX = new RegExp(SELF_DOMAIN.replace(/\./g, '\\.'), 'i');
 
 // ---------------------------------------------------------------- db
+try { require('fs').mkdirSync(require('path').dirname(DB_PATH), { recursive: true }); } catch (e) { }   // v1.0.1: never die on a missing folder (Render without the /data disk mounted)
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -52,6 +53,8 @@ CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT NOT NULL, at INTEGER
 CREATE TABLE IF NOT EXISTS intent(id TEXT NOT NULL, field TEXT NOT NULL, val TEXT, at INTEGER, PRIMARY KEY(id, field));
 CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, tries INTEGER DEFAULT 0, at INTEGER, lastErr TEXT);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS wo(id TEXT PRIMARY KEY, date TEXT, json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS wo_date ON wo(date);
 `);
 const q = {
   upsert: db.prepare('INSERT INTO rows(id,lane,ts,json,updatedAt) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET lane=excluded.lane, ts=excluded.ts, json=excluded.json, updatedAt=excluded.updatedAt'),
@@ -73,6 +76,10 @@ const q = {
   outDel: db.prepare('DELETE FROM outbox WHERE id=?'),
   outFail: db.prepare('UPDATE outbox SET tries=tries+1, lastErr=? WHERE id=?'),
   outCount: db.prepare('SELECT COUNT(*) n FROM outbox'),
+  woUp: db.prepare('INSERT INTO wo(id,date,json) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET date=excluded.date, json=excluded.json'),
+  woAll: db.prepare('SELECT json FROM wo ORDER BY date'),
+  woClear: db.prepare('DELETE FROM wo'),
+  woCount: db.prepare('SELECT COUNT(*) n FROM wo'),
 };
 const meta = { get: (k) => { const r = q.metaGet.get(k); return r ? r.v : ''; }, set: (k, v) => q.metaSet.run(k, String(v)) };
 const state = {
@@ -96,8 +103,8 @@ function fetchJson(u, opt) {
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf8');
         // Apps Script answers with a 302 to googleusercontent — follow once.
-        if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location && !opt._redirected) {
-          return fetchJson(res.headers.location, Object.assign({}, opt, { _redirected: true, method: 'GET', body: null })).then(resolve, reject);
+        if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303 || res.statusCode === 307) && res.headers.location && (opt._hops || 0) < 4) {   // v1.1.1: Apps Script can bounce twice
+          return fetchJson(res.headers.location, Object.assign({}, opt, { _hops: (opt._hops || 0) + 1, method: 'GET', body: null })).then(resolve, reject);
         }
         let j = null; try { j = JSON.parse(raw); } catch (e) { }
         resolve({ status: res.statusCode, json: j, raw });
@@ -197,7 +204,8 @@ async function draftMap() {
 }
 async function upsertThreads(ids, draftT) {
   const byEmail = clientsByEmail();
-  const got = await pmap(ids, 8, (id) => gapi('GET', '/threads/' + encodeURIComponent(id), { format: 'metadata', metadataHeaders: ['From', 'Subject'] }));
+  // v1.0.1: gentle on Gmail's per-user per-minute budget (the first full pull of 400 threads at 8-wide tripped a 403)
+  const got = await pmap(ids, ids.length > 60 ? 3 : 8, async (id, k) => { if (ids.length > 60 && k % 50 === 49) await new Promise((r) => setTimeout(r, 4000)); return gapi('GET', '/threads/' + encodeURIComponent(id), { format: 'metadata', metadataHeaders: ['From', 'Subject'] }); });
   const now = Date.now();
   const tx = db.transaction(() => {
     got.forEach((t, i) => {
@@ -279,6 +287,44 @@ async function gasPull() {
     // the kit confirmed what it holds: intents older than this pull that agree with it are spent
     q.intentDelOld.run(now - 10 * 60000);
   } catch (e) { gas.lastErr = String(e && e.message || e).slice(0, 300); console.error('[gas]', gas.lastErr); }
+}
+// ---------------------------------------------------------------- work orders + clients mirror (v1.1, phase 1)
+// The kit stays the writer. Every few seconds we ask hook=wofeed 'anything new since <gen>?' (two cache stamps on the
+// kit side, ~1s). On a change we take the full slim feed - the exact payload getWorkOrdersData hands the app - and the
+// clients list, and replace the mirror whole. The app reads /wo in ~100ms. /wo?fresh=1 pulls first, so a reload that
+// follows the owner's own save never sees the pre-save world.
+const wo = { busy: null, lastAt: 0, lastFull: 0, err: '', gen: '', peeks: 0, fulls: 0, ms: 0, extra: {} };
+async function woPull(force) {
+  if (!GAS_URL) return;
+  if (wo.busy) return wo.busy;
+  wo.busy = (async () => {
+    const t0 = Date.now();
+    try {
+      const r = await fetchJson(GAS_URL + '?hook=wofeed&k=' + encodeURIComponent(GAS_KEY) + '&since=' + encodeURIComponent(force ? '' : (meta.get('wo_gen') || '')), { timeout: 90000 });
+      if (!r.json || !r.json.ok) throw new Error('wofeed ' + r.status + ' ' + (r.raw || '').slice(0, 160));
+      const j = r.json; wo.peeks++;
+      if (j.same) { wo.lastAt = Date.now(); wo.err = ''; return; }
+      const rows = (j.wo && j.wo.workOrders) || [];
+      const extra = {}; Object.keys(j.wo || {}).forEach((k) => { if (k !== 'workOrders') extra[k] = j.wo[k]; });
+      const tx = db.transaction(() => {
+        q.woClear.run();
+        rows.forEach((w) => { if (w && w.id) q.woUp.run(String(w.id), String(w.scheduledDate || ''), JSON.stringify(w)); });
+        state.set('wo_extra', extra);
+        if (j.clients) state.set('clients_full', j.clients);
+      });
+      tx();
+      meta.set('wo_gen', j.gen || '');
+      wo.gen = j.gen || ''; wo.lastAt = wo.lastFull = Date.now(); wo.err = ''; wo.fulls++; wo.ms = Date.now() - t0;
+    } catch (e) { wo.err = String(e && e.message || e).slice(0, 300); console.error('[wo]', wo.err); }
+    finally { wo.busy = null; }
+  })();
+  return wo.busy;
+}
+function woPayload() {
+  const rows = q.woAll.all().map((r) => { try { return JSON.parse(r.json); } catch (e) { return null; } }).filter(Boolean);
+  const extra = state.get('wo_extra', {});
+  const body = Object.assign({}, extra, { workOrders: rows, _via: 'data-svc', gen: meta.get('wo_gen') || '', syncedAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err });
+  return body;
 }
 async function outboxTick() {
   if (!GAS_URL) return;
@@ -433,7 +479,7 @@ let _etag = '';
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
   if (req.method === 'OPTIONS') return send(res, 204, {}, req);
-  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, err: gas.lastErr, pulls: gas.pulls, lastMs: gas.ms, outbox: q.outCount.get().n } }, req);
+  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, err: gas.lastErr, pulls: gas.pulls, lastMs: gas.ms, outbox: q.outCount.get().n }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
   const key = u.query.key || req.headers['x-inbox-key'] || '';
   if (!KEY || key !== KEY) return send(res, 403, { ok: false, message: 'forbidden' }, req);
   try {
@@ -455,6 +501,19 @@ const server = http.createServer(async (req, res) => {
       const a = await gapi('GET', '/messages/' + encodeURIComponent(String(u.query.msg || '')) + '/attachments/' + encodeURIComponent(String(u.query.att || '')));
       return send(res, 200, { success: true, dataB64: b64(a.data).toString('base64') }, req);
     }
+    if (u.pathname === '/wo') {
+      if (String(u.query.fresh || '') === '1' || !wo.lastFull) await woPull(false);
+      const body = woPayload();
+      const et = require('crypto').createHash('md5').update(body.gen + '|' + wo.lastFull).digest('hex');
+      if (u.query.etag && u.query.etag === et) return send(res, 200, { ok: true, same: true, etag: et, gen: body.gen, syncedAt: wo.lastAt }, req);
+      body.etag = et; body.ok = true; return send(res, 200, body, req);
+    }
+    if (u.pathname === '/wo/peek') {   // the app's 15s doorbell: {ok, token, changes:[]} - a new token with no changes makes the app reload from /wo (100ms)
+      const tok = meta.get('wo_gen') || '';
+      return send(res, 200, { ok: true, token: tok, changes: [], changed: String(u.query.since || '') !== tok, syncedAt: wo.lastAt }, req);
+    }
+    if (u.pathname === '/clients') { return send(res, 200, { clients: state.get('clients_full', []), _via: 'data-svc', syncedAt: wo.lastFull }, req); }
+    if (req.method === 'POST' && u.pathname === '/wo/pull') { await woPull(String(u.query.full || '') === '1'); return send(res, 200, { ok: true, gen: wo.gen, err: wo.err, rows: q.woCount.get().n }, req); }
     if (req.method === 'POST' && u.pathname === '/inbox/act') { const b = await readBody(req); return send(res, 200, await act(b), req); }
     if (req.method === 'POST' && u.pathname === '/inbox/pull') { await gasPull(); return send(res, 200, { ok: true, kitAt: gas.lastAt, err: gas.lastErr }, req); }
     if (req.method === 'POST' && u.pathname === '/inbox/resync') { await fullSync(); return send(res, 200, { ok: true, rows: q.all.all().length }, req); }
@@ -469,6 +528,8 @@ if (require.main === module) {
   setInterval(() => { gasPull(); }, 30000);
   setInterval(() => { outboxTick().catch(() => { }); }, 5000);
   setInterval(draftTick, 60000);
+  setTimeout(() => { woPull(true); }, 1500);
+  setInterval(() => { woPull(false); }, 5000);
 } else {
   module.exports = { mailRow, fmtDate, inboxSource, assemble, plainOf, state, q };
 }
