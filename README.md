@@ -1,4 +1,4 @@
-# aggie-inbox v1.0 — the APS inbox off Google Apps Script
+# aggie-inbox v1.6
 
 **What it does:** keeps your unified inbox ready 24/7 so the app reads it in ~100ms.
 Emails sync straight from Gmail every 10s (history deltas). Calls / texts / FB / IG rows
@@ -65,12 +65,27 @@ If the service is down or unset, the app silently uses Apps Script exactly as be
 | `POST /inbox/act` | `{act, ids, folder?, keys?, examples?}` — acts: trash archive star unstar read unread done undone filed mach unmach mute unmute ops unops |
 | `POST /inbox/pull` | pull the kit lanes now |
 | `POST /inbox/resync` | full Gmail rebuild |
+| `GET /wo?fresh=0\|1&etag=` | **v1.1** the work-order board — the exact payload `getWorkOrdersData` hands the app; `fresh=1` pulls the kit first (the app sends it for 30s after any board write) |
+| `GET /wo/peek?since=` | **v1.1** the app's 15s doorbell (`{ok, token, changes:[]}`) |
+| `GET /clients` | **v1.1** the customer list (`getClientsData` shape) |
+| `POST /wo/pull?full=0\|1` | **v1.1** pull the kit's board now |
+| `GET /ctx?phone=&recent=1` | **v1.4 (phase 2)** Aggie's context in one read: `{client, wos, sms, calls, recent}` — the customer by phone, their jobs, their last 40 texts, their last 10 calls, the 30 newest calls overall |
+| `POST /comms/pull` | **v1.4** pull the kit's raw calls + texts now |
+
+**v1.4 sync (phase 2):** every 10s the service asks the kit `hook=commsraw&sinceCalls=&sinceSms=` for new call/text rows (tail reads, ~1s); every 10 min the last 400 calls + 1200 text rows whole. The kit's `svcCtx_` reads `/ctx`; on any failure it trips a 5-min breaker and Aggie falls back to the sheets. Needs kit **v38.655+**. `DEPLOY_CHECK` step 20 proves it.
+
+**v1.1 sync:** every 5s the service asks the kit `hook=wofeed&since=<gen>` (two cache stamps, ~1s); only on a change does it take the full feed (2–6s on the kit). The kit remains the writer. Needs kit **v38.649+**.
 
 ## Rules it keeps (from the kit)
 - Row shape = the kit's `mailRow_` + `getUnifiedInbox` overlay, field for field.
 - Text/call "delete" = handled-forever (v38.439); the record stays.
 - Handled bounce-back (v31.3/v31.9): they spoke after you filed it → back out of Handled.
 - The owner's taps override the mirror for 15 minutes or until the kit confirms.
+
+## v1.6 (Sept 25)
+- Hard wall-clock deadline on every kit call (idle timeouts let a hung response freeze the lane for 18 hours).
+- Watchdog frees a pull stuck 'busy' > 200 s; `/health` shows `busyFor` and `watchdog` counts.
+- Owner taps (outbox → hook=ibxact) run on their own line, never behind a pull; `/health.kit.outboxOldest` shows the head of the queue.
 
 ## If something's off
 - `/health` → `gmail.err` says "credentials missing" → env vars; "invalid_grant" → re-run get-token.js (token revoked).
