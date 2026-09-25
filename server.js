@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.5';
+const VERSION = '1.6';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -103,7 +103,19 @@ const state = {
 };
 
 // ---------------------------------------------------------------- http helpers
+// v1.6 A HARD DEADLINE ON EVERY CALL (Sept 25: kit.busy stuck since Sept 24 2:33 PM, 14,709 beats skipped, 23 owner taps
+// queued behind it for 18 hours -> threads bounced back to Unsorted). Node's request timeout is an IDLE timeout: a response that
+// keeps the socket alive without ever ending hangs forever, and a hung promise froze the whole kit lane. Now every call has a
+// wall-clock deadline (timeout + 10s) after which it is destroyed and rejected, whatever the socket is doing.
 function fetchJson(u, opt) {
+  opt = opt || {};
+  const inner = fetchJsonInner(u, opt);
+  const ms = (opt.timeout || 25000) + 10000;
+  let timer;
+  const deadline = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('hard timeout ' + ms + 'ms')), ms); });
+  return Promise.race([inner, deadline]).finally(() => clearTimeout(timer));
+}
+function fetchJsonInner(u, opt) {
   opt = opt || {};
   return new Promise((resolve, reject) => {
     const U = new URL(u);
@@ -284,8 +296,8 @@ async function draftTick() {
 // rows - seconds, not 50). Every 10 minutes: the full build with the clients list, replacing the lane whole (that is
 // how rows that fell out of the kit's window leave). Overlap of 90s on the incremental so nothing slips between beats.
 // The kit is a single slow web app - never ask it two things at once (kitCall serializes every kit request).
-const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0, lastFull: 0, incs: 0, lastLanes: null, lastRows: 0, busy: false, skipped: 0 };
-const _kitQueues = { lanes: Promise.resolve(), wo: Promise.resolve() };
+const gas = { lastAt: 0, lastErr: '', pulls: 0, ms: 0, lastFull: 0, incs: 0, lastLanes: null, lastRows: 0, busy: false, busyAt: 0, skipped: 0, watchdog: 0 };
+const _kitQueues = { lanes: Promise.resolve(), wo: Promise.resolve(), acts: Promise.resolve() };   // v1.6: the owner's taps have their own line - a slow or stuck pull never holds them
 function kitCall(fn, lane) { lane = lane || 'lanes'; const p = _kitQueues[lane].then(fn, fn); _kitQueues[lane] = p.catch(() => { }); return p; }   // v1.2: board pulls have their own line - a 50s lane build never holds a drag's fresh read
 async function gasPull(mode) {
   if (!GAS_URL) return;
@@ -293,7 +305,7 @@ async function gasPull(mode) {
   // answering in ~38s the line grew 18 minutes deep (health lastMs 1115113, Sept 23). A beat that finds an ask in flight
   // now steps aside; an explicit 'full' (the app's resync, the /inbox/pull door) still waits its turn.
   if (gas.busy && mode !== 'full') { gas.skipped++; return; }
-  gas.busy = true;
+  gas.busy = true; gas.busyAt = Date.now();
   const full = (mode === 'full') || !gas.lastFull || (Date.now() - gas.lastFull > 10 * 60000);
   let t0 = Date.now();
   try {
@@ -320,13 +332,13 @@ async function gasPull(mode) {
 // The kit stays the writer of calls and texts. Every 10s we ask hook=commsraw 'rows since <ts>' (tail reads only, ~1s);
 // every 10 min the last 400 calls + 1200 text rows whole. GET /ctx?phone= hands Aggie everything she used to scan
 // three sheets for: the customer, their jobs, their texts, their calls, and the 30 most recent calls overall.
-const comms = { busy: false, lastAt: 0, lastFull: 0, err: '', pulls: 0, ms: 0, skipped: 0, lastCalls: 0, lastSms: 0 };
+const comms = { busy: false, busyAt: 0, lastAt: 0, lastFull: 0, err: '', pulls: 0, ms: 0, skipped: 0, lastCalls: 0, lastSms: 0, watchdog: 0 };
 function p10(x) { return String(x || '').replace(/[^0-9]/g, '').slice(-10); }
 function smsKey(r) { return String(r.platform || '') + '|' + String(r.senderId || '') + '|' + String(r.ts || '') + '|' + require('crypto').createHash('md5').update(String(r.text || '')).digest('hex').slice(0, 12); }
 async function commsPull(mode) {
   if (!GAS_URL) return;
   if (comms.busy && mode !== 'full') { comms.skipped++; return; }
-  comms.busy = true;
+  comms.busy = true; comms.busyAt = Date.now();
   const full = (mode === 'full') || !comms.lastFull || (Date.now() - comms.lastFull > 10 * 60000);
   let t0 = Date.now();
   try {
@@ -402,7 +414,7 @@ async function outboxTick() {
   if (!GAS_URL) return;
   for (const row of q.outNext.all()) {
     try {
-      const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxact&k=' + encodeURIComponent(GAS_KEY), { method: 'POST', body: row.payload, timeout: 60000 }));
+      const r = await kitCall(() => fetchJson(GAS_URL + '?hook=ibxact&k=' + encodeURIComponent(GAS_KEY), { method: 'POST', body: row.payload, timeout: 60000 }), 'acts');   // v1.6 own lane
       if (r.json && r.json.ok) q.outDel.run(row.id);
       else if (row.tries >= 20) { q.outDel.run(row.id); console.error('[outbox] dropped after 20 tries', row.payload.slice(0, 120)); }
       else q.outFail.run(String((r.raw || '').slice(0, 200)), row.id);
@@ -552,7 +564,7 @@ let _etag = '';
 const server = http.createServer(async (req, res) => {
   const u = url.parse(req.url, true);
   if (req.method === 'OPTIONS') return send(res, 204, {}, req);
-  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, busy: gas.busy, skipped: gas.skipped, lanes: gas.lastLanes, outbox: q.outCount.get().n }, comms: { calls: q.crCount.get().n, sms: q.smCount.get().n, lastAt: comms.lastAt, lastFull: comms.lastFull, err: comms.err, pulls: comms.pulls, lastMs: comms.ms, busy: comms.busy, skipped: comms.skipped }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
+  if (u.pathname === '/health') return send(res, 200, { inbox: VERSION, db: DB_PATH, diskLooksMounted: (function () { try { const st = require('fs').statSync(require('path').dirname(DB_PATH)); const root = require('fs').statSync('/'); return st.dev !== root.dev; } catch (e) { return false; } })(), rows: q.all.all().length, gmail: { lastAt: sync.lastAt, err: sync.lastErr, full: sync.full, delta: sync.delta, changed: sync.changed, historyId: meta.get('historyId'), creds: !!(CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN) }, kit: { url: !!GAS_URL, lastAt: gas.lastAt, lastFull: gas.lastFull, err: gas.lastErr, pulls: gas.pulls, incs: gas.incs, lastMs: gas.ms, lastRows: gas.lastRows, busy: gas.busy, busyFor: gas.busy ? Math.round((Date.now() - gas.busyAt) / 1000) : 0, watchdog: gas.watchdog, skipped: gas.skipped, lanes: gas.lastLanes, outbox: q.outCount.get().n, outboxOldest: (function () { try { const r = q.outNext.all()[0]; return r ? { tries: r.tries, err: (db.prepare('SELECT lastErr FROM outbox WHERE id=?').get(r.id) || {}).lastErr || '' } : null; } catch (e) { return null; } })() }, comms: { calls: q.crCount.get().n, sms: q.smCount.get().n, lastAt: comms.lastAt, lastFull: comms.lastFull, err: comms.err, pulls: comms.pulls, lastMs: comms.ms, busy: comms.busy, busyFor: comms.busy ? Math.round((Date.now() - comms.busyAt) / 1000) : 0, watchdog: comms.watchdog, skipped: comms.skipped }, wo: { rows: q.woCount.get().n, clients: (state.get('clients_full', []) || []).length, lastAt: wo.lastAt, lastFull: wo.lastFull, err: wo.err, peeks: wo.peeks, fulls: wo.fulls, lastMs: wo.ms, gen: meta.get('wo_gen') || '' } }, req);
   const key = u.query.key || req.headers['x-inbox-key'] || '';
   if (!KEY || key !== KEY) return send(res, 403, { ok: false, message: 'forbidden' }, req);
   try {
@@ -600,10 +612,15 @@ if (require.main === module) {
   // ---------------------------------------------------------------- beats
   setTimeout(() => { syncTick(); gasPull('full'); }, 500);
   setInterval(syncTick, 10000);
-  setInterval(() => { gasPull(); }, 10000);
+  setInterval(() => { gasPull(); }, 30000);   // v1.6: was 10s - with a 40-80s pull that was a continuous load on the kit; the app's resync door still forces a full pull
   setTimeout(() => { commsPull('full'); }, 3000);
-  setInterval(() => { commsPull(); }, 10000);   // v1.4
+  setInterval(() => { commsPull(); }, 30000);   // v1.4 · v1.6: 30s beat
   setInterval(() => { outboxTick().catch(() => { }); }, 5000);
+  setInterval(() => {   // v1.6 WATCHDOG: a pull that has been 'busy' longer than any call can legally take is dead - free the beat
+    const now = Date.now();
+    if (gas.busy && gas.busyAt && now - gas.busyAt > 200000) { gas.busy = false; gas.watchdog++; gas.lastErr = 'watchdog freed a stuck lanes pull after ' + Math.round((now - gas.busyAt) / 1000) + 's'; console.error('[watchdog] ' + gas.lastErr); }
+    if (comms.busy && comms.busyAt && now - comms.busyAt > 200000) { comms.busy = false; comms.watchdog++; comms.err = 'watchdog freed a stuck comms pull after ' + Math.round((now - comms.busyAt) / 1000) + 's'; console.error('[watchdog] ' + comms.err); }
+  }, 30000);
   setInterval(draftTick, 60000);
   setTimeout(() => { woPull(true); }, 1500);
   setInterval(() => { woPull(false); }, 5000);
