@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.6';
+const VERSION = '1.7';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -157,7 +157,18 @@ async function token() {
   _tok = { v: r.json.access_token, exp: Date.now() + (Number(r.json.expires_in) || 3500) * 1000 };
   return _tok.v;
 }
-async function gapi(method, path, query, body) {
+// v1.7 GMAIL SAYS SLOW DOWN (owner, Sept 27 10:56 AM: 'Delete complete — 49 removed · 4 failed · gmail 429 ×3'). A 429 or a 5xx
+// is retried three times with a growing pause (1 s, 2 s, 4 s) before it counts as a failure; a burst of 40 trashes no longer
+// throws four of them back on the screen.
+async function gapi(method, path, query, body, _try) {
+  _try = _try || 0;
+  try { return await gapiOnce_(method, path, query, body); }
+  catch (e) {
+    if ((e.status === 429 || (e.status >= 500 && e.status < 600)) && _try < 3) { await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, _try))); return gapi(method, path, query, body, _try + 1); }
+    throw e;
+  }
+}
+async function gapiOnce_(method, path, query, body) {
   const t = await token();
   const qs = query ? ('?' + Object.keys(query).filter((k) => query[k] != null).map((k) => Array.isArray(query[k]) ? query[k].map((v) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&') : encodeURIComponent(k) + '=' + encodeURIComponent(query[k])).join('&')) : '';
   const r = await fetchJson('https://gmail.googleapis.com/gmail/v1/users/me' + path + qs, { method, body: body == null ? null : body, headers: { Authorization: 'Bearer ' + t } });
@@ -514,7 +525,7 @@ async function act(body) {
     // the row leaves NOW; Gmail is told in parallel; a Gmail failure puts the row back and says so
     tx(() => { ids.forEach((id) => q.intentSet.run(id, 'gone', '1', now)); });
     if (mail.length) {
-      const r = await pmap(mail, 10, (id) => a === 'trash' ? gapi('POST', '/threads/' + encodeURIComponent(id) + '/trash') : gapi('POST', '/threads/' + encodeURIComponent(id) + '/modify', null, { removeLabelIds: ['INBOX'] }));
+      const r = await pmap(mail, 5, (id) => a === 'trash' ? gapi('POST', '/threads/' + encodeURIComponent(id) + '/trash') : gapi('POST', '/threads/' + encodeURIComponent(id) + '/modify', null, { removeLabelIds: ['INBOX'] }));
       tx(() => { r.forEach((x, i) => { if (x && x.__err && !/gmail 404/.test(x.__err)) { res.failed.push(mail[i]); q.intentDelId.run(mail[i]); } else { res.gmail++; q.del.run(mail[i]); } }); });
     }
     if (other.length) { // comms delete = handled-forever (kit law v38.439): the words stay on record
