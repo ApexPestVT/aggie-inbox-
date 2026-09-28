@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.7';
+const VERSION = '1.8';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -482,6 +482,61 @@ function plainOf(m) {
   if (!txt && m.payload && m.payload.body && m.payload.body.data) txt = b64(m.payload.body.data).toString('utf8');
   return txt || String(m.snippet || '');
 }
+// v1.8 THE BODY THAT WASN'T THERE (owner, Sept 28 9:41 AM: a USPS Informed Delivery digest opened as a 200-character snippet
+// with 'tap to load' on its image). The API's parsed payload carried no text/html data for that message - a large or oddly
+// nested part comes back as an attachmentId or with no data at all - so both readers fell to the snippet. Two recoveries, in
+// order: a text part that arrived as an attachmentId is fetched like one; failing that, the RAW RFC-822 message is fetched and
+// parsed here (boundaries, base64 / quoted-printable, charset) for its text/html or text/plain.
+function qpDecode(str) { return Buffer.from(String(str || '').replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (m, h) => String.fromCharCode(parseInt(h, 16))), 'latin1'); }
+function mimeDecodeBody(raw, enc, charset) {
+  enc = String(enc || '').toLowerCase().trim(); charset = String(charset || 'utf-8').toLowerCase().replace(/"/g, '').trim();
+  let buf;
+  if (enc === 'base64') buf = Buffer.from(String(raw || '').replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+  else if (enc === 'quoted-printable') buf = qpDecode(raw);
+  else buf = Buffer.from(String(raw || ''), 'latin1');
+  if (/^(iso-8859-1|latin1|windows-1252|us-ascii)$/.test(charset)) return buf.toString('latin1');
+  return buf.toString('utf8');
+}
+function mimeSplit(msg) {   // -> { headers:{}, body:string } with header continuation lines folded
+  const i = msg.search(/\r?\n\r?\n/); const head = i < 0 ? msg : msg.slice(0, i); const body = i < 0 ? '' : msg.slice(i).replace(/^\r?\n\r?\n/, '');
+  const headers = {}; head.replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/).forEach((ln) => { const m = /^([^:]+):\s*(.*)$/.exec(ln); if (m) headers[m[1].toLowerCase()] = m[2]; });
+  return { headers, body };
+}
+function mimeWalk(msg, acc) {   // collects {type, text} for every text/* leaf
+  const { headers, body } = mimeSplit(msg);
+  const ct = String(headers['content-type'] || 'text/plain');
+  const type = ct.split(';')[0].trim().toLowerCase();
+  if (type.indexOf('multipart/') === 0) {
+    const bm = /boundary="?([^";]+)"?/i.exec(ct); if (!bm) return acc;
+    const parts = body.split('--' + bm[1]);
+    for (let k = 1; k < parts.length; k++) { const p = parts[k]; if (/^--/.test(p)) break; mimeWalk(p.replace(/^\r?\n/, ''), acc); }
+    return acc;
+  }
+  if (type === 'text/html' || type === 'text/plain') {
+    const cs = /charset="?([^";]+)"?/i.exec(ct);
+    const disp = String(headers['content-disposition'] || '');
+    if (!/^attachment/i.test(disp)) acc.push({ type, text: mimeDecodeBody(body, headers['content-transfer-encoding'], cs ? cs[1] : 'utf-8') });
+  }
+  return acc;
+}
+async function recoverBody(m, htmlParts) {
+  // (a) a text/html part that came as an attachmentId
+  try {
+    const attHtml = findParts(m.payload, (p) => p.mimeType === 'text/html' && p.body && p.body.attachmentId && !p.body.data, []);
+    if (attHtml.length) { const a = await gapi('GET', '/messages/' + encodeURIComponent(m.id) + '/attachments/' + encodeURIComponent(attHtml[0].body.attachmentId)); const h = b64(a.data).toString('utf8'); if (h.trim()) return { html: h, text: '', via: 'att' }; }
+  } catch (e) { console.error('[thread.recover.att]', String(e && e.message || e).slice(0, 200)); }
+  // (b) the raw message
+  try {
+    const r = await gapi('GET', '/messages/' + encodeURIComponent(m.id), { format: 'raw' });
+    if (r && r.raw) {
+      const leaves = mimeWalk(b64(r.raw).toString('latin1'), []);
+      const html = (leaves.find((x) => x.type === 'text/html') || {}).text || '';
+      const text = (leaves.find((x) => x.type === 'text/plain') || {}).text || '';
+      if (html.trim() || text.trim()) return { html, text, via: 'raw' };
+    }
+  } catch (e) { console.error('[thread.recover.raw]', String(e && e.message || e).slice(0, 200)); }
+  return null;
+}
 async function mailThread(threadId) {
   const t0 = Date.now(); let fetched = 0;
   const t = await gapi('GET', '/threads/' + encodeURIComponent(threadId), { format: 'full' });
@@ -492,6 +547,12 @@ async function mailThread(threadId) {
   for (const m of msgsA) {
     const htmlParts = findParts(m.payload, (p) => p.mimeType === 'text/html' && p.body && p.body.data, []);
     let html = htmlParts.length ? b64(htmlParts[0].body.data).toString('utf8') : '';
+    let bodyTxt = plainOf(m);
+    let recovered = '';
+    if (!html.trim() && bodyTxt.length <= 260) {   // v1.8 nothing but the snippet: go get the real body
+      const rec = await recoverBody(m, htmlParts);
+      if (rec) { html = rec.html || html; if (rec.text && rec.text.length > bodyTxt.length) bodyTxt = rec.text; recovered = rec.via; console.log('[thread] ' + threadId + ' msg ' + m.id + ': body recovered via ' + rec.via + ' (' + html.length + ' html chars)'); }
+    }
     html = html.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
     const attParts = findParts(m.payload, (p) => p.body && p.body.attachmentId, []);
     const atts = [];
@@ -508,7 +569,7 @@ async function mailThread(threadId) {
     }
     html = html.replace(/src="cid:[^"]*"/gi, 'src=""');
     const isDraft = (m.labelIds || []).indexOf('DRAFT') >= 0;
-    out.push({ isDraft, from: (isDraft ? '👻 DRAFT — not sent · ' : '') + hdr(m, 'From'), date: fmtDate(m.internalDate), body: plainOf(m).slice(0, 3000), html: html.slice(0, 900000), atts });
+    out.push({ isDraft, from: (isDraft ? '👻 DRAFT — not sent · ' : '') + hdr(m, 'From'), date: fmtDate(m.internalDate), body: bodyTxt.slice(0, 3000), html: html.slice(0, 900000), atts, _recovered: recovered || undefined });
   }
   return { id: threadId, subject: hdr((t.messages || [{}])[0], 'Subject'), msgs: out, _tookMs: Date.now() - t0, _attInline: fetched, _via: 'inbox-svc', gmailUrl: 'https://mail.google.com/mail/?authuser=Sales@ApexPestSolutionsllc.com#all/' + threadId };
 }
