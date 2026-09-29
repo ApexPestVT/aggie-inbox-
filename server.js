@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.10';
+const VERSION = '1.11';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -699,7 +699,7 @@ if (require.main === module) {
   }, 30000);
   setInterval(draftTick, 60000);
   setTimeout(() => { woPull(true); }, 1500);
-  setInterval(() => { woPull(false); }, 5000);
+  setInterval(() => { woPull(false); }, 15000);   // v1.11: was 5 s - Executions Sept 28 showed a doGet every 5 s around the clock, 2-10 s of kit time each; the app's own 30 s peek and the post-save fresh read still make a drag land in seconds
 } else {
   module.exports = { mailRow, fmtDate, inboxSource, assemble, plainOf, state, q };
 }
