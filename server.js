@@ -28,7 +28,7 @@ const url = require('url');
 const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
-const VERSION = '1.9';
+const VERSION = '1.10';
 const PORT = process.env.PORT || 10000;
 const KEY = process.env.INBOX_KEY || '';
 const DB_PATH = process.env.DB_PATH || '/data/inbox.db';
@@ -444,20 +444,7 @@ function assemble() {
   let out = [];
   const parsed = [];
   for (const r of q.all.all()) { let j; try { j = JSON.parse(r.json); } catch (e) { continue; } parsed.push(j); }
-  // v1.9 ONE STAMP PER THREAD (kit v38.708): a person's calls and texts are one thread (tkey); the Handled stamp was keyed to the one
-  // row tapped, and the thread could show through an unstamped sibling whenever the face row changed. The newest stamp on any row of
-  // the thread - the kit's map or the owner's tap still in flight - now rules the thread.
-  const dnTk = {};
-  for (const j of parsed) {
-    const k = String(j.tkey || ''); if (!k) continue;
-    let vv = dn[String(j.id)]; const I0 = intents[String(j.id)] || {};
-    if ('done' in I0) vv = (I0.done === '1') ? Date.now() : 0;
-    if (vv === undefined) continue;
-    const n = (vv === 1 || vv === '1') ? 1 : Number(vv); if (isNaN(n)) continue;
-    if (dnTk[k] === undefined || Math.abs(n) > Math.abs(dnTk[k])) dnTk[k] = n;
-  }
-  const tapTk = {};   // tkey -> the owner's most recent in-flight done/undone tap on any row of the thread
-  for (const j of parsed) { const I0 = intents[String(j.id)] || {}; if ('done' in I0 && j.tkey) tapTk[String(j.tkey)] = (I0.done === '1'); }
+  // v1.9 tried one Handled stamp per thread; v1.10 took it back (it hid text threads). The stamp is the row's.
   for (const j of parsed) {
     const I = intents[String(j.id)] || {};
     if (I.gone === '1') continue;
@@ -465,7 +452,7 @@ function assemble() {
     if (st[String(j.id)]) j.starred = true;
     if (op[String(j.id)]) j.ops = true;
     let v = dn[String(j.id)];
-    if (v === undefined && j.tkey && dnTk[String(j.tkey)] !== undefined) v = dnTk[String(j.tkey)];   // v1.9
+    // v1.10 the stamp is the row's again - 1.9's thread inheritance hid every text thread whose person had an old call marked Handled (kit v38.710 same)
     const dAt = (v === 1 || v === '1') ? 0 : (Number(v) || 0);
     const spk = (j.spokeTs !== undefined) ? Number(j.spokeTs || 0) : Number(j.ts || 0);   // v1.5: texts carry when THEY last spoke (kit v38.663); system rows never bounce a handled thread
     if (v && Number(v) !== 0) { if (spk > dAt && (j.unread || !j.answered)) j.done = false; else j.done = true; }
@@ -475,7 +462,7 @@ function assemble() {
     else { let p = String(j.id || '').split('|')[1] || ''; p = p.replace(/[^0-9]/g, '').slice(-10); if (p && mu[p]) j.muted = true; }
     // the owner's own taps, until the kit confirms them
     if ('done' in I) { j.done = (I.done === '1'); if (I.done === '0') j.reopened = true; if (j.done) j._unh = false; }
-    else if (j.tkey && tapTk[String(j.tkey)] !== undefined) { j.done = tapTk[String(j.tkey)]; if (j.done) j._unh = false; }   // v1.9 the owner's tap on a sibling row of this thread, still in flight
+
     if ('filed' in I) j.filed = I.filed || '';
     if ('unread' in I) j.unread = (I.unread === '1');
     if ('starred' in I) j.starred = (I.starred === '1');
